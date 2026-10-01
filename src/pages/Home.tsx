@@ -31,6 +31,41 @@ interface GoogleDetailsResponse {
   data: Partial<Restaurant>;
 }
 
+// 🌟 前端詳細數據緩衝佇列
+let pendingDetailsQueue: Restaurant[] = [];
+
+function flushBatchDetailsQueue() {
+  if (pendingDetailsQueue.length === 0) return;
+  const payload = [...pendingDetailsQueue];
+  pendingDetailsQueue = []; // 清空佇列
+
+  const base = import.meta.env.VITE_WORKER_API_URL?.replace(/\/$/, '') ?? '';
+  const url = `${base}/api/places/batch-details`;
+
+  try {
+    fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+      keepalive: true, // 頁面關閉或切後台時依然能傳送完成
+    }).catch(() => {
+      // 失敗時補回佇列
+      pendingDetailsQueue.unshift(...payload);
+    });
+  } catch {
+    pendingDetailsQueue.unshift(...payload);
+  }
+}
+
+function queueRestaurantDetail(detail: Restaurant) {
+  if (!pendingDetailsQueue.some((item) => item.id === detail.id)) {
+    pendingDetailsQueue.push(detail);
+  }
+  if (pendingDetailsQueue.length >= 5) {
+    flushBatchDetailsQueue();
+  }
+}
+
 function formatBadgeCount(count: number): string {
   if (count >= 1000) {
     const k = Math.floor(count / 1000);
@@ -124,7 +159,10 @@ function formatPriceLevel(level?: string): string | undefined {
   if (!level || level === 'PRICE_LEVEL_UNSPECIFIED') return undefined;
   const labels: Record<string, string> = {
     PRICE_LEVEL_FREE: '免費',
-    PRICE_LEVEL_INEXPENSIVE: '$',     PRICE_LEVEL_MODERATE: '$$',     PRICE_LEVEL_EXPENSIVE: '$$$',     PRICE_LEVEL_VERY_EXPENSIVE: '$$$$',
+    PRICE_LEVEL_INEXPENSIVE: '$',
+    PRICE_LEVEL_MODERATE: '$$',
+    PRICE_LEVEL_EXPENSIVE: '$$$',
+    PRICE_LEVEL_VERY_EXPENSIVE: '$$$$',
   };
   return labels[level] ?? level;
 }
@@ -183,6 +221,27 @@ export const HomePage = () => {
   const [spinId, setSpinId] = useState(0);
   const rawCandidatesRef = useRef<Restaurant[]>([]);
   const selectedRestaurantRef = useRef<Restaurant | null>(null);
+
+  // 🌟 定時器与切頁離場事件監聽：批量刷入 KV
+  useEffect(() => {
+    const timer = setInterval(() => {
+      flushBatchDetailsQueue();
+    }, 30000);
+
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === 'hidden') {
+        flushBatchDetailsQueue();
+      }
+    };
+
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+
+    return () => {
+      clearInterval(timer);
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+      flushBatchDetailsQueue(); // 組件卸載時整理一次
+    };
+  }, []);
 
   const updateSelection = (restaurant: Restaurant | null) => {
     if (restaurant?.id !== selectedRestaurantRef.current?.id) {
@@ -439,11 +498,13 @@ export const HomePage = () => {
     if (!googleId) return;
 
     void fetchGoogleDetails(`google:${googleId}`).then((detailed) => {
+      let fullUpdatedRestaurant: Restaurant | null = null;
+
       const mergeDetails = (item: Restaurant) => {
         const isMatch = item.id === restaurant.id || (googleId && item.googlePlaceId === googleId);
         if (!isMatch) return item;
 
-        return {
+        const merged: Restaurant = {
           ...item,
           name: detailed.name || item.name,
           address: detailed.address || item.address,
@@ -455,6 +516,9 @@ export const HomePage = () => {
           googleMapsUri: detailed.googleMapsUri || item.googleMapsUri,
           dataUpdatedAt: detailed.dataUpdatedAt ?? item.dataUpdatedAt,
         };
+
+        fullUpdatedRestaurant = merged;
+        return merged;
       };
 
       rawCandidatesRef.current = rawCandidatesRef.current.map(mergeDetails);
@@ -463,6 +527,11 @@ export const HomePage = () => {
 
       if (selectedRestaurantRef.current?.id === restaurant.id) {
         setCurrentSelected((prev) => (prev ? mergeDetails(prev) : null));
+      }
+
+      // 🌟 将查询到的最新餐厅详情推送至本地打包队列
+      if (fullUpdatedRestaurant) {
+        queueRestaurantDetail(fullUpdatedRestaurant);
       }
     }).catch(() => {
       // 靜默處理
@@ -616,7 +685,6 @@ export const HomePage = () => {
             <Roulette key={spinId} candidates={processedCandidates} autoStart onFinish={updateSelection} />
           )}
 
-          {/* 距離標籤：完美置於輪盤下方，視覺重心極佳 */}
           {!isLoading && candidates.length > 0 && (
             <div className="mt-3.5 inline-flex items-center gap-2 rounded-full border border-[#dfe4d8] dark:border-[#25352b] bg-white/80 dark:bg-[#16201a]/80 px-4 py-1.5 text-xs font-bold text-[#4a5c47] dark:text-[#9bb398] shadow-xs backdrop-blur-xs">
               {isRefreshing ? <RotateCw className="size-3.5 animate-spin" /> : <MapPin className="size-3.5 text-[#263d30] dark:text-[#88c298]" />}
@@ -627,7 +695,7 @@ export const HomePage = () => {
           {errorMessage && !isLoading && <p role="status" className="mt-2 text-center text-xs text-[#c34f54] dark:text-[#e07579]">{errorMessage}</p>}
         </section>
 
-        {/* 選中餐廳精緻卡片 */}
+        {/* 選中餐廳卡片 */}
         {currentSelected && preferences && (
           <section className="mt-2 mb-3 rounded-3xl border border-[#dfe4d8] dark:border-[#25352b] bg-white dark:bg-[#16201a] p-5 shadow-xl shadow-black/5">
             <div className="flex items-start justify-between gap-4">

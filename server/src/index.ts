@@ -1,7 +1,7 @@
 import ngeohash from 'ngeohash';
 import * as OpenCC from 'opencc-js';
 
-const GRID_CACHE_TTL_SECONDS = 30 * 24 * 60 * 60;
+const GRID_CACHE_TTL_SECONDS = 30 * 24 * 60 * 60; // 30 天网格快取
 const FEHD_QUERY_URL = 'https://portal.csdi.gov.hk/server/rest/services/common/fehd_rcd_1630036390312_58893/FeatureServer/0/query';
 
 const toSimplifiedChinese = OpenCC.Converter({ from: 'hk', to: 'cn' });
@@ -133,7 +133,7 @@ function extractShopNumber(address: string): string | null {
 
 const corsHeaders = (env: Env): HeadersInit => ({
   'Access-Control-Allow-Origin': env.ALLOWED_ORIGIN || '*',
-  'Access-Control-Allow-Methods': 'GET, OPTIONS',
+  'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
   'Access-Control-Allow-Headers': 'Content-Type',
   'Access-Control-Expose-Headers': 'X-Cache',
   'Vary': 'Origin',
@@ -145,6 +145,23 @@ const jsonResponse = (body: unknown, status: number, env: Env, extraHeaders?: He
   if (extraHeaders) new Headers(extraHeaders).forEach((value, key) => headers.set(key, value));
   return new Response(JSON.stringify(body), { status, headers });
 };
+
+// IP 頻率限制 (Rate Limiting)
+async function checkRateLimit(request: Request, env: Env): Promise<boolean> {
+  const clientIp = request.headers.get('CF-Connecting-IP') || 'unknown';
+  const rateKey = `rate_limit:${clientIp}`;
+  try {
+    const currentCount = await env.GEO_CACHE.get(rateKey);
+    const count = currentCount ? Number(currentCount) : 0;
+    if (count > 40) { // 提高上線容忍度
+      return false;
+    }
+    await env.GEO_CACHE.put(rateKey, String(count + 1), { expirationTtl: 60 });
+  } catch {
+    // 略過 KV 異常
+  }
+  return true;
+}
 
 function readNumber(url: URL, name: string): number | null {
   const raw = url.searchParams.get(name);
@@ -372,7 +389,6 @@ function mergePlaces(sourceGroups: Restaurant[][]): Restaurant[] {
   for (const sourceGroup of sourceGroups) {
     for (const candidate of sourceGroup) {
       const candidateName = normalizePlaceText(candidate.name);
-      const candidateAddr = normalizePlaceText(candidate.address);
       const candidateShop = extractShopNumber(candidate.address);
       const candidateCoreBrand = extractCoreBrandName(candidate.name);
 
@@ -408,12 +424,10 @@ function mergePlaces(sourceGroups: Restaurant[][]): Restaurant[] {
         const candidatePrio = SOURCE_PRIORITY[candidate.source] || 0;
         const existingPrio = SOURCE_PRIORITY[existing.source] || 0;
 
-        // 規則：如果新條目是 Google（具備 googlePlaceId 或 source 為 google），而舊條目是 fehd，強制以 Google 優先覆蓋為核心主體
         const isGoogleCandidate = Boolean(candidate.googlePlaceId || candidate.source === 'google');
         const isExistingFehd = existing.source === 'fehd' && !existing.googlePlaceId;
 
         if (isGoogleCandidate && isExistingFehd) {
-          // 強制將 Google 數據提升為主體
           merged[existingIndex] = {
             ...existing,
             ...candidate,
@@ -453,7 +467,6 @@ function mergePlaces(sourceGroups: Restaurant[][]): Restaurant[] {
           if (candidate.googleMapsUri) existing.googleMapsUri = candidate.googleMapsUri;
           if (candidate.dataUpdatedAt) existing.dataUpdatedAt = candidate.dataUpdatedAt;
         }
-
       } else {
         merged.push({
           ...candidate,
@@ -517,7 +530,7 @@ async function fetchPlacesForGridCell(
   env: Env,
   fehdMaster: Record<string, Restaurant>
 ): Promise<Restaurant[]> {
-  const gridCacheKey = `grid:v6:${region}:${gh7}`;
+  const gridCacheKey = `grid:v7:${region}:${gh7}`;
   const cached = await env.GEO_CACHE.get(gridCacheKey, 'json') as Restaurant[] | null;
   if (cached) return cached;
 
@@ -557,6 +570,73 @@ export default {
     if (request.method === 'OPTIONS') return new Response(null, { status: 204, headers: corsHeaders(env) });
     if (url.pathname === '/health') return jsonResponse({ ok: true }, 200, env);
 
+    // 啟動 API 頻率限制防護
+    if (!(await checkRateLimit(request, env))) {
+      return jsonResponse({ error: '請求過於頻繁，請稍後再試。' }, 429, env);
+    }
+
+    // 🌟 1. 前端打包回傳詳細數據：批量回填寫入 KV (按 Geohash 7 級網格分組)
+    if (url.pathname === '/api/places/batch-details') {
+      if (request.method !== 'POST') return jsonResponse({ error: 'Method not allowed' }, 405, env);
+
+      try {
+        const detailsList = (await request.json()) as Restaurant[];
+        if (!Array.isArray(detailsList) || detailsList.length === 0) {
+          return jsonResponse({ ok: true, processed: 0 }, 200, env);
+        }
+
+        // 將收到的詳細數據按网格 Key (grid:v7:${region}:${gh7}) 分組
+        const updatesByGridKey: Record<string, Restaurant[]> = {};
+
+        for (const item of detailsList) {
+          if (!item.lat || !item.lng || !item.id) continue;
+          const itemRegion = inferRegion(item.lat, item.lng);
+          const gh7 = ngeohash.encode(item.lat, item.lng, 7);
+          const gridCacheKey = `grid:v7:${itemRegion}:${gh7}`;
+
+          if (!updatesByGridKey[gridCacheKey]) {
+            updatesByGridKey[gridCacheKey] = [];
+          }
+          updatesByGridKey[gridCacheKey].push(item);
+        }
+
+        // 針對涉及到的每個網格，讀取 KV -> 合併新詳情 -> 一次性寫回 KV (大幅降低 KV Write 次數)
+        const writePromises = Object.entries(updatesByGridKey).map(async ([gridKey, newItems]) => {
+          const cached = (await env.GEO_CACHE.get(gridKey, 'json')) as Restaurant[] | null;
+          if (!cached || !Array.isArray(cached)) return;
+
+          const itemMap = new Map(cached.map((r) => [r.id, r]));
+          let updated = false;
+
+          for (const newItem of newItems) {
+            const existing = itemMap.get(newItem.id);
+            if (existing) {
+              itemMap.set(newItem.id, {
+                ...existing,
+                ...newItem,
+                sources: Array.from(new Set([...(existing.sources || [existing.source]), ...(newItem.sources || [newItem.source])])),
+                dataUpdatedAt: newItem.dataUpdatedAt || Date.now(),
+              });
+              updated = true;
+            }
+          }
+
+          if (updated) {
+            await env.GEO_CACHE.put(gridKey, JSON.stringify(Array.from(itemMap.values())), {
+              expirationTtl: GRID_CACHE_TTL_SECONDS,
+            });
+          }
+        });
+
+        await Promise.allSettled(writePromises);
+
+        return jsonResponse({ ok: true, processed: detailsList.length }, 200, env);
+      } catch {
+        return jsonResponse({ error: 'Failed to batch update details' }, 500, env);
+      }
+    }
+
+    // 2. 單家餐廳即時獲取詳細資訊
     if (url.pathname === '/api/places/details') {
       if (request.method !== 'GET') return jsonResponse({ error: 'Method not allowed' }, 405, env);
 
@@ -604,6 +684,7 @@ export default {
       }
     }
 
+    // 3. 餐廳列表搜尋接口
     if (url.pathname !== '/api/places') return jsonResponse({ error: 'Not found' }, 404, env);
     if (request.method !== 'GET') return jsonResponse({ error: 'Method not allowed' }, 405, env);
 
