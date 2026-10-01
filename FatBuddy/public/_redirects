@@ -1,1 +1,2 @@
 /api/*  https://server.fatbuddy.workers.dev/api/:splat  200
+/health https://server.fatbuddy.workers.dev/health  200
