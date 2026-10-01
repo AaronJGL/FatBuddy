@@ -1,0 +1,4 @@
+GOOGLE_MAPS_KEY=replace-with-google-places-web-service-key
+AMAP_KEY=replace-with-amap-web-service-key
+# Optional. Defaults to * when omitted.
+# ALLOWED_ORIGIN=https://your-pages-project.pages.dev
