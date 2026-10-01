@@ -10,8 +10,8 @@ const FEHD_QUERY_URL = 'https://portal.csdi.gov.hk/server/rest/services/common/f
 // 優先使用回應速度較快、對亞洲區友好的 Overpass 鏡像站
 const DEFAULT_OVERPASS_URL = 'https://overpass.kumi.systems/api/interpreter';
 //const DEFAULT_OVERPASS_URL = 'https://overpass-api.de/api/interpreter';
-const OSM_QUERY_TIMEOUT_SECONDS = 8;
-const OSM_REQUEST_TIMEOUT_MS = 8000;
+const OSM_QUERY_TIMEOUT_SECONDS = 2;
+const OSM_REQUEST_TIMEOUT_MS = 2500;
 const OSM_RESULT_LIMIT = 100;
 const AMAP_RESULT_LIMIT = 25;
 //const toSimplifiedChinese = OpenCC.Converter({ from: 'tw', to: 'cn' });

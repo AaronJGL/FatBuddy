@@ -42,19 +42,24 @@ const wrapText = (text: string, maxWidth: number, context: CanvasRenderingContex
 };
 
 export interface Restaurant {
-  id: string
-  name: string
-  lat?: number
-  lng?: number
-  rating?: number
-  address?: string
-  source?: 'google' | 'amap' | 'fehd' | 'osm'
-  type?: string
-  price?: string
-  priceLevel?: string
-  userRatingCount?: number
-  licenseType?: string
-  dataUpdatedAt?: string
+  id: string;
+  name: string;
+  lat?: number;
+  lng?: number;
+  rating?: number;
+  userRatingCount?: number;
+  address?: string;
+  type?: string;
+  price?: string;
+  priceLevel?: string;
+  licenseType?: string;
+  dataUpdatedAt?: string;
+  source?: 'google' | 'amap' | 'fehd' | 'osm';
+  googlePlaceId?: string;
+  amapPoiId?: string;
+  fehdObjectId?: string;
+  osmId?: string;
+  sources?: Array<'google' | 'amap' | 'fehd' | 'osm'>;
 }
 
 interface RouletteProps {
@@ -67,7 +72,6 @@ export const Roulette: React.FC<RouletteProps> = ({ candidates, autoStart = true
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const candidatesRef = useRef(candidates);
   const onFinishRef = useRef(onFinish);
-  const candidateKey = JSON.stringify(candidates.map((restaurant) => restaurant.id));
 
   useEffect(() => {
     candidatesRef.current = candidates;
@@ -80,8 +84,10 @@ export const Roulette: React.FC<RouletteProps> = ({ candidates, autoStart = true
   useEffect(() => {
     const canvas = canvasRef.current;
     const context = canvas?.getContext('2d');
+    if (!canvas || !context) return;
+
     const activeCandidates = candidatesRef.current;
-    if (!canvas || !context || activeCandidates.length === 0) return;
+    if (activeCandidates.length === 0) return;
 
     const pixelRatio = window.devicePixelRatio || 1;
     canvas.width = WIDTH * pixelRatio;
@@ -107,14 +113,17 @@ export const Roulette: React.FC<RouletteProps> = ({ candidates, autoStart = true
     let selectedRestaurant: Restaurant | null = null;
 
     const restaurantAt = (wheelStep: number) => {
+      const currentList = candidatesRef.current;
+      if (currentList.length === 0) return { name: '' } as Restaurant;
+
       if (motion === 'slowing' || motion === 'stopped') {
         const sequenceIndex = wheelStep - stopStartStep;
         if (sequenceIndex >= 0 && sequenceIndex < stopSequence.length) {
           const restaurantIndex = stopSequence[sequenceIndex];
-          return activeCandidates[restaurantIndex];
+          return currentList[restaurantIndex % currentList.length] || currentList[0];
         }
       }
-      return activeCandidates[modulo(wheelStep, activeCandidates.length)];
+      return currentList[modulo(wheelStep, currentList.length)];
     };
 
     const draw = () => {
@@ -150,6 +159,8 @@ export const Roulette: React.FC<RouletteProps> = ({ candidates, autoStart = true
           : sectorDistance;
         const wheelStep = wholePosition - signedSectorDistance;
         const restaurant = restaurantAt(wheelStep);
+        if (!restaurant || !restaurant.name) continue;
+
         const labelRadius = RADIUS * 0.65;
         const labelX = CENTER_X + Math.cos(labelAngle) * labelRadius;
         const labelY = BASE_Y + Math.sin(labelAngle) * labelRadius;
@@ -157,7 +168,6 @@ export const Roulette: React.FC<RouletteProps> = ({ candidates, autoStart = true
 
         context.save();
         context.fillStyle = '#FFFFFF';
-        context.font = '600 16px sans-serif';
         context.textAlign = 'center';
         context.textBaseline = 'middle';
         context.shadowColor = 'rgba(0, 0, 0, 0.3)';
@@ -195,16 +205,20 @@ export const Roulette: React.FC<RouletteProps> = ({ candidates, autoStart = true
     };
 
     const pickIndex = (excludedIndices: number[]) => {
-      const availableIndices = activeCandidates
+      const currentList = candidatesRef.current;
+      const availableIndices = currentList
         .map((_, index) => index)
         .filter((index) => !excludedIndices.includes(index));
       return availableIndices.length > 0
         ? availableIndices[Math.floor(Math.random() * availableIndices.length)]
-        : Math.floor(Math.random() * activeCandidates.length);
+        : Math.floor(Math.random() * currentList.length);
     };
 
     const beginSlowdown = (time: number, quick = false) => {
-      const selectedIndex = Math.floor(Math.random() * activeCandidates.length);
+      const currentList = candidatesRef.current;
+      if (currentList.length === 0) return;
+
+      const selectedIndex = Math.floor(Math.random() * currentList.length);
       const currentStep = Math.floor(position);
       const fractionalPosition = position - currentStep;
       automaticSlowdown = !quick;
@@ -213,19 +227,19 @@ export const Roulette: React.FC<RouletteProps> = ({ candidates, autoStart = true
         : (speed * AUTO_STOP_DURATION) / AUTO_STOP_EASE_SLOPE
           + Math.floor(Math.random() * AUTO_STOP_EXTRA_STEPS);
       const targetOffset = Math.max(1, Math.ceil(fractionalPosition + targetDistance));
-      stopSequence = [modulo(currentStep, activeCandidates.length)];
+      stopSequence = [modulo(currentStep, currentList.length)];
 
       for (let step = 1; step <= targetOffset; step += 1) {
         const previousIndex = stopSequence[stopSequence.length - 1];
         const nextIndex = step === targetOffset
           ? selectedIndex
           : step === 1
-            ? modulo(currentStep + 1, activeCandidates.length)
+            ? modulo(currentStep + 1, currentList.length)
             : pickIndex([selectedIndex, previousIndex]);
         stopSequence.push(nextIndex);
       }
 
-      selectedRestaurant = activeCandidates[selectedIndex];
+      selectedRestaurant = currentList[selectedIndex];
       stopStartStep = currentStep;
       stopStartPosition = position;
       const usedAfterSelection = new Set([selectedIndex]);
@@ -297,7 +311,7 @@ export const Roulette: React.FC<RouletteProps> = ({ candidates, autoStart = true
     };
 
     const handleInteraction = () => {
-      if (motion === 'idle') {
+      if (motion === 'idle' || motion === 'stopped') {
         motion = 'spinning';
         speed = 0;
         targetSpeed = INITIAL_SPIN_SPEED;
@@ -327,7 +341,7 @@ export const Roulette: React.FC<RouletteProps> = ({ candidates, autoStart = true
       canvas.removeEventListener('click', handleInteraction);
       canvas.removeEventListener('keydown', handleKeyDown);
     };
-  }, [autoStart, candidateKey]);
+  }, [autoStart]); // 不以 candidates 作為 dependency，避免選單資料更新時誤發重置
 
   return (
     <div className="relative mx-auto w-full max-w-sm">
@@ -335,12 +349,11 @@ export const Roulette: React.FC<RouletteProps> = ({ candidates, autoStart = true
         ref={canvasRef}
         width={WIDTH}
         height={HEIGHT}
-        className="block h-auto w-full drop-shadow-lg"
+        className="block h-auto w-full cursor-pointer drop-shadow-lg transition-transform duration-150 ease-in-out hover:scale-[1.02] active:scale-[0.98]"
         style={{ aspectRatio: `${WIDTH} / ${HEIGHT}` }}
         role="button"
         tabIndex={0}
-        aria-label="餐廳抽選轉盤，點擊快速減速停止"
-        title="點擊快速減速停止"
+        aria-label="餐廳抽選轉盤"
       />
     </div>
   );
