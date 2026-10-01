@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { Clock3, Heart, ListChecks, MapPin, Navigation, NotebookPen, RotateCw, Settings, ShieldBan } from 'lucide-react';
+import { Clock3, Heart, ListChecks, MapPin, Navigation, NotebookPen, Pencil, RotateCw, Settings, ShieldBan, Trash2, X } from 'lucide-react';
 import { Roulette, type Restaurant } from '../components/Roulette';
 import { ManagementDialog } from '../components/ManagementDialog';
 import { add24hTempExclusion, getValidCandidates } from '../utils/filter';
@@ -17,7 +17,7 @@ interface MealNote {
 
 const DEFAULT_PREFERENCES: AppPreferences = { id: 'default', searchRadius: 500 };
 const LOCATION_ID = 'last';
-const CACHE_ID = 'latest_v2';
+const CACHE_ID = 'latest_v3';
 const CACHE_DISTANCE_METERS = 200;
 
 type ViewMode = 'settings' | 'participants' | 'exclusions' | 'blacklist' | 'reviews' | 'favorites';
@@ -28,11 +28,15 @@ interface PlacesResponse {
 }
 
 interface GoogleDetailsResponse {
-  data: {
-    rating: number;
-    userRatingCount?: number;
-    priceLevel?: string;
-  };
+  data: Partial<Restaurant>;
+}
+
+function formatBadgeCount(count: number): string {
+  if (count >= 1000) {
+    const k = Math.floor(count / 1000);
+    return `${k}k+`;
+  }
+  return String(count);
 }
 
 function distanceMeters(lat1: number, lng1: number, lat2: number, lng2: number): number {
@@ -91,23 +95,29 @@ async function fetchPlaces(
   return result;
 }
 
-async function fetchGoogleDetails(placeId: string): Promise<GoogleDetailsResponse['data']> {
+async function fetchGoogleDetails(placeId: string): Promise<Partial<Restaurant>> {
   const query = new URLSearchParams({ id: placeId });
   const response = await fetch(workerApiUrl(`/api/places/details?${query}`));
   const result = await response.json() as GoogleDetailsResponse & { error?: string };
-  if (!response.ok) throw new Error(result.error ?? 'Google 餐廳資料載入失敗。');
+  if (!response.ok) throw new Error(result.error ?? '餐廳詳細資料載入失敗。');
   return result.data;
 }
 
-function getNavigationLinks(restaurant: Restaurant): Array<{ name: string; url: string }> {
+function getSmartNavUrl(restaurant: Restaurant, region: 'hk' | 'cn' | 'global'): string {
+  if (region === 'cn') {
+    if (restaurant.lat !== undefined && restaurant.lng !== undefined) {
+      return `https://uri.amap.com/marker?coordinate=${restaurant.lng},${restaurant.lat}&name=${encodeURIComponent(restaurant.name)}&src=FatBuddy`;
+    }
+    return `https://uri.amap.com/search?keyword=${encodeURIComponent(restaurant.name)}`;
+  }
+  if (restaurant.googleMapsUri) {
+    return restaurant.googleMapsUri;
+  }
+  if (restaurant.googlePlaceId) {
+    return `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(restaurant.name)}&query_place_id=${restaurant.googlePlaceId}`;
+  }
   const searchText = encodeURIComponent(`${restaurant.name} ${restaurant.address ?? ''}`.trim());
-  const googleUrl = restaurant.googlePlaceId
-    ? `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(restaurant.name)}&query_place_id=${restaurant.googlePlaceId}`
-    : `https://www.google.com/maps/search/?api=1&query=${searchText}`;
-  const amapUrl = restaurant.lat !== undefined && restaurant.lng !== undefined
-    ? `https://uri.amap.com/marker?coordinate=${restaurant.lng},${restaurant.lat}&name=${encodeURIComponent(restaurant.name)}&src=FatBuddy`
-    : `https://uri.amap.com/search?keyword=${searchText}`;
-  return [{ name: 'Google Maps', url: googleUrl }, { name: '高德地圖', url: amapUrl }];
+  return `https://www.google.com/maps/search/?api=1&query=${searchText}`;
 }
 
 function formatPriceLevel(level?: string): string | undefined {
@@ -119,28 +129,55 @@ function formatPriceLevel(level?: string): string | undefined {
   return labels[level] ?? level;
 }
 
+export function formatCategory(type?: string): string | undefined {
+  if (!type) return undefined;
+  if (/[\u4e00-\u9fa5]/.test(type)) return type;
+
+  const map: Record<string, string> = {
+    'chinese restaurant': '中菜館',
+    'japanese restaurant': '日本料理',
+    'korean restaurant': '韓國料理',
+    'western restaurant': '西式餐廳',
+    'fast food restaurant': '快餐店',
+    'seafood restaurant': '海鮮菜館',
+    'asian restaurant': '亞洲菜',
+    'italian restaurant': '意式餐廳',
+    'french restaurant': '法式餐廳',
+    'thai restaurant': '泰式料理',
+    'vietnamese restaurant': '越南菜',
+    'ramen restaurant': '拉麵店',
+    'sushi restaurant': '壽司店',
+    'hot pot restaurant': '火鍋店',
+    'barbecue restaurant': '燒烤/燒肉',
+    'dessert shop': '甜品糖水店',
+    'coffee shop': '咖啡店',
+    'cafe': '咖啡店',
+    'restaurant': '餐廳',
+  };
+
+  const key = type.toLowerCase().trim();
+  return map[key] ?? type;
+}
+
 export const HomePage = () => {
   const [preferences, setPreferences] = useState<AppPreferences | null>(null);
   const [draftPreferences, setDraftPreferences] = useState<Omit<AppPreferences, 'id'>>(DEFAULT_PREFERENCES);
   const [preferencesReady, setPreferencesReady] = useState(false);
   const [dialogOpen, setDialogOpen] = useState(false);
   const [dialogView, setDialogView] = useState<ViewMode>('settings');
-  const [radiusPreviewCount, setRadiusPreviewCount] = useState<number | null>(null);
-  const [isPreviewingRadius, setIsPreviewingRadius] = useState(false);
-  const [radiusPreviewError, setRadiusPreviewError] = useState('');
   const [candidates, setCandidates] = useState<Restaurant[]>([]);
   const [allCandidates, setAllCandidates] = useState<Restaurant[]>([]);
+  const [tempExclusionCount, setTempExclusionCount] = useState<number>(0);
   const [currentSelected, setCurrentSelected] = useState<Restaurant | null>(null);
   const [userLocation, setUserLocation] = useState<{ lat: number; lng: number } | null>(null);
   const [favoriteIds, setFavoriteIds] = useState<Set<string>>(new Set());
   const [isLoading, setIsLoading] = useState(true);
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [isSavingNote, setIsSavingNote] = useState(false);
-  const [isLoadingDetails, setIsLoadingDetails] = useState(false);
-  const [googleDetails, setGoogleDetails] = useState<{ placeId: string; data: GoogleDetailsResponse['data'] } | null>(null);
   const [errorMessage, setErrorMessage] = useState('');
   const [noteText, setNoteText] = useState('');
   const [noteRating, setNoteRating] = useState(0);
+  const [editingNoteId, setEditingNoteId] = useState<number | null>(null);
   const [notesHistory, setNotesHistory] = useState<MealNote[]>([]);
   const [isFavorite, setIsFavorite] = useState(false);
   const [spinId, setSpinId] = useState(0);
@@ -151,18 +188,22 @@ export const HomePage = () => {
     if (restaurant?.id !== selectedRestaurantRef.current?.id) {
       setNoteText('');
       setNoteRating(0);
+      setEditingNoteId(null);
       setNotesHistory([]);
       setIsFavorite(false);
-      setGoogleDetails(null);
     }
     selectedRestaurantRef.current = restaurant;
     setCurrentSelected(restaurant);
   };
 
-  const loadFavorites = async () => {
+  const loadFavoritesAndExclusionsCount = async () => {
     try {
-      const favs = await db.favorites.toArray();
+      const [favs, activeExclusions] = await Promise.all([
+        db.favorites.toArray(),
+        db.tempExclusions.where('expiredAt').above(Date.now()).count(),
+      ]);
       setFavoriteIds(new Set(favs.map((f) => f.id)));
+      setTempExclusionCount(activeExclusions);
     } catch {
       // 靜默處理
     }
@@ -171,16 +212,14 @@ export const HomePage = () => {
   const openManagementView = (view: ViewMode) => {
     if (preferences) {
       setDraftPreferences({ searchRadius: preferences.searchRadius });
-      setRadiusPreviewCount(candidates.length);
-      setRadiusPreviewError('');
     }
     setDialogView(view);
     setDialogOpen(true);
   };
 
   useEffect(() => {
-    void loadFavorites();
-  }, [currentSelected]);
+    void loadFavoritesAndExclusionsCount();
+  }, [currentSelected, dialogOpen]);
 
   useEffect(() => {
     let cancelled = false;
@@ -196,7 +235,7 @@ export const HomePage = () => {
         }
       })
       .catch(() => {
-        if (!cancelled) setErrorMessage('無法讀取本機設定，請檢查瀏覽器儲存空間。');
+        if (!cancelled) setErrorMessage('無法讀取本機設定。');
       })
       .finally(() => {
         if (!cancelled) setPreferencesReady(true);
@@ -221,7 +260,7 @@ export const HomePage = () => {
           db.lastKnownLocations.get(LOCATION_ID),
         ]);
       } catch {
-        setErrorMessage('無法讀取本機餐廳快取。');
+        // 靜默處理
       }
 
       if (lastLocation && !cancelled) {
@@ -229,9 +268,23 @@ export const HomePage = () => {
       }
 
       const lastRegion = lastLocation ? getDataRegion(lastLocation.lat, lastLocation.lng) : null;
-      const settingsMatch = cache?.region === lastRegion && cache.radius === preferences.searchRadius;
+      const settingsMatch = cache?.region === lastRegion;
       const locationPairMatch = cache && lastLocation
         && distanceMeters(cache.lat, cache.lng, lastLocation.lat, lastLocation.lng) < 1;
+
+      if (cache && settingsMatch && locationPairMatch && cache.candidates.length > 0 && cache.radius >= preferences.searchRadius) {
+        rawCandidatesRef.current = cache.candidates;
+        const filtered = cache.candidates.filter((item: Restaurant) => 
+          lastLocation && distanceMeters(lastLocation.lat, lastLocation.lng, item.lat, item.lng) <= preferences.searchRadius
+        );
+        setAllCandidates(filtered);
+        setCandidates(await getValidCandidates(filtered));
+        if (cancelled) return;
+        updateSelection(null);
+        setIsLoading(false);
+        return;
+      }
+
       if (cache && settingsMatch && locationPairMatch && cache.candidates.length > 0) {
         rawCandidatesRef.current = cache.candidates;
         setAllCandidates(cache.candidates);
@@ -254,8 +307,20 @@ export const HomePage = () => {
       }
 
       const region = getDataRegion(location.lat, location.lng);
-      const cacheIsNearby = Boolean(cache && cache.region === region && cache.radius === preferences.searchRadius
+      const cacheIsNearby = Boolean(cache && cache.region === region && cache.radius >= preferences.searchRadius
         && distanceMeters(cache.lat, cache.lng, location.lat, location.lng) < CACHE_DISTANCE_METERS);
+      
+      if (cacheIsNearby && cache) {
+        rawCandidatesRef.current = cache.candidates;
+        const filtered = cache.candidates.filter((item: Restaurant) => 
+          distanceMeters(location.lat, location.lng, item.lat, item.lng) <= preferences.searchRadius
+        );
+        setAllCandidates(filtered);
+        setCandidates(await getValidCandidates(filtered));
+        setIsLoading(false);
+        return;
+      }
+
       if (!cacheIsNearby) {
         rawCandidatesRef.current = [];
         setAllCandidates([]);
@@ -283,14 +348,10 @@ export const HomePage = () => {
         const eligible = await getValidCandidates(result.data);
         if (cancelled) return;
         if (!selectedRestaurantRef.current) setCandidates(eligible);
-        else if (!eligible.some((restaurant) => restaurant.id === selectedRestaurantRef.current?.id)) {
-          setCandidates(eligible);
-          updateSelection(null);
-        }
         setErrorMessage('');
       } catch (requestError) {
         if (!cancelled) {
-          const prefix = cacheWasDisplayed ? '目前顯示上次快取。' : '';
+          const prefix = cacheWasDisplayed ? '目前顯示快取。' : '';
           setErrorMessage(`${prefix}${requestError instanceof Error ? requestError.message : '附近餐廳載入失敗。'}`);
         }
       } finally {
@@ -305,47 +366,6 @@ export const HomePage = () => {
     return () => { cancelled = true; };
   }, [preferences, preferencesReady]);
 
-  useEffect(() => {
-    if (!dialogOpen || dialogView !== 'settings') return;
-    if (preferences && !isLoading && preferences.searchRadius === draftPreferences.searchRadius) return;
-    let cancelled = false;
-    const timeout = window.setTimeout(() => {
-      const previewRadius = async () => {
-        setIsPreviewingRadius(true);
-        setRadiusPreviewError('');
-        try {
-          const savedLocation = await db.lastKnownLocations.get(LOCATION_ID);
-          const location = savedLocation ?? await getCurrentLocation();
-          const result = await fetchPlaces(location, draftPreferences.searchRadius);
-          const eligible = await getValidCandidates(result.data);
-          if (!cancelled) setRadiusPreviewCount(eligible.length);
-        } catch (previewError) {
-          if (!cancelled) setRadiusPreviewError(previewError instanceof Error ? previewError.message : '目前無法計算餐廳數');
-        } finally {
-          if (!cancelled) setIsPreviewingRadius(false);
-        }
-      };
-      void previewRadius();
-    }, 700);
-    return () => { cancelled = true; window.clearTimeout(timeout); };
-  }, [dialogOpen, dialogView, draftPreferences.searchRadius, preferences, isLoading]);
-
-  useEffect(() => {
-    let cancelled = false;
-    if (currentSelected) {
-      void Promise.all([
-        db.notes.where('placeId').equals(currentSelected.id).toArray(),
-        db.favorites.get(currentSelected.id),
-      ]).then(([notes, favorite]) => {
-        if (cancelled) return;
-        const sortedNotes = (notes as MealNote[]).sort((first, second) => second.updatedAt - first.updatedAt);
-        setNotesHistory(sortedNotes);
-        setIsFavorite(Boolean(favorite));
-      });
-    }
-    return () => { cancelled = true; };
-  }, [currentSelected]);
-
   const savePreferences = async () => {
     const nextPreferences: AppPreferences = { id: 'default', ...draftPreferences };
     if (preferences?.searchRadius === nextPreferences.searchRadius) {
@@ -354,27 +374,36 @@ export const HomePage = () => {
     }
     await db.preferences.put(nextPreferences);
     setPreferences(nextPreferences);
-    updateSelection(null);
+    
+    if (rawCandidatesRef.current.length > 0 && userLocation) {
+      const filtered = rawCandidatesRef.current.filter((item) => 
+        distanceMeters(userLocation.lat, userLocation.lng, item.lat, item.lng) <= nextPreferences.searchRadius
+      );
+      setAllCandidates(filtered);
+      const eligible = await getValidCandidates(filtered);
+      setCandidates(eligible);
+      updateSelection(null);
+    }
+
     setDialogOpen(false);
   };
 
   const refreshCandidates = async () => {
     const eligible = await getValidCandidates(rawCandidatesRef.current);
     setCandidates(eligible);
-    await loadFavorites();
+    await loadFavoritesAndExclusionsCount();
     if (selectedRestaurantRef.current && !eligible.some((place) => place.id === selectedRestaurantRef.current?.id)) {
       updateSelection(null);
     }
   };
 
-  // 排除此店再轉：寫入 IndexedDB 臨時排除 (24小時) + 重新旋轉
-const handleNextTime = async () => {
-  if (!currentSelected) return;
-  await add24hTempExclusion(currentSelected.id, currentSelected);
-  await refreshCandidates();
-  updateSelection(null);
-  setSpinId((prev) => prev + 1);
-};
+  const handleNextTime = async () => {
+    if (!currentSelected) return;
+    await add24hTempExclusion(currentSelected.id, currentSelected);
+    await refreshCandidates();
+    updateSelection(null);
+    setSpinId((current) => current + 1);
+  };
 
   const handleBlacklist = async () => {
     if (!currentSelected) return;
@@ -402,61 +431,105 @@ const handleNextTime = async () => {
       await db.favorites.put({ ...currentSelected, savedAt: Date.now() });
       setIsFavorite(true);
     }
-    await loadFavorites();
+    await loadFavoritesAndExclusionsCount();
   };
 
-  const loadGoogleDetails = async () => {
-    const targetId = currentSelected?.googlePlaceId || currentSelected?.id;
-    if (!currentSelected || !targetId || googleDetails || isLoadingDetails) return;
-    setIsLoadingDetails(true);
-    try {
-      const data = await fetchGoogleDetails(targetId);
-      setGoogleDetails({ placeId: currentSelected.id, data });
-    } catch (detailsError) {
-      setErrorMessage(detailsError instanceof Error ? detailsError.message : '餐廳詳情載入失敗。');
-    } finally {
-      setIsLoadingDetails(false);
-    }
+  const handleNavClick = (restaurant: Restaurant) => {
+    const googleId = restaurant.googlePlaceId || (restaurant.id.startsWith('google:') ? restaurant.id.slice(7) : null);
+    if (!googleId) return;
+
+    void fetchGoogleDetails(`google:${googleId}`).then((detailed) => {
+      const mergeDetails = (item: Restaurant) => {
+        const isMatch = item.id === restaurant.id || (googleId && item.googlePlaceId === googleId);
+        if (!isMatch) return item;
+
+        return {
+          ...item,
+          name: detailed.name || item.name,
+          address: detailed.address || item.address,
+          rating: detailed.rating ?? item.rating,
+          userRatingCount: detailed.userRatingCount ?? item.userRatingCount,
+          priceLevel: detailed.priceLevel ?? item.priceLevel,
+          type: formatCategory(detailed.type) || item.type,
+          phone: detailed.phone || item.phone,
+          googleMapsUri: detailed.googleMapsUri || item.googleMapsUri,
+          dataUpdatedAt: detailed.dataUpdatedAt ?? item.dataUpdatedAt,
+        };
+      };
+
+      rawCandidatesRef.current = rawCandidatesRef.current.map(mergeDetails);
+      setAllCandidates((prev) => prev.map(mergeDetails));
+      setCandidates((prev) => prev.map(mergeDetails));
+
+      if (selectedRestaurantRef.current?.id === restaurant.id) {
+        setCurrentSelected((prev) => (prev ? mergeDetails(prev) : null));
+      }
+    }).catch(() => {
+      // 靜默處理
+    });
   };
 
   const saveNote = async () => {
     if (!currentSelected || !noteText.trim() || noteRating < 1) return;
     setIsSavingNote(true);
     try {
-      const publishedAt = Date.now();
-      const newNote = {
-        placeId: currentSelected.id,
-        restaurantName: currentSelected.name,
-        rating: noteRating,
-        notes: noteText.trim(),
-        updatedAt: publishedAt,
-        publishedAt,
-      };
-      await db.notes.add(newNote);
+      const now = Date.now();
+      if (editingNoteId) {
+        await db.notes.update(editingNoteId, {
+          rating: noteRating,
+          notes: noteText.trim(),
+          updatedAt: now,
+        });
+      } else {
+        await db.notes.add({
+          placeId: currentSelected.id,
+          restaurantName: currentSelected.name,
+          rating: noteRating,
+          notes: noteText.trim(),
+          updatedAt: now,
+          publishedAt: now,
+        });
+      }
       setNoteText('');
       setNoteRating(0);
+      setEditingNoteId(null);
       const updatedNotes = await db.notes.where('placeId').equals(currentSelected.id).toArray();
       setNotesHistory((updatedNotes as MealNote[]).sort((a, b) => b.updatedAt - a.updatedAt));
     } catch {
-      setErrorMessage('評論發布失敗，請再試一次。');
+      setErrorMessage('評論發布失敗。');
     } finally {
       setIsSavingNote(false);
     }
   };
 
-  const closeDialog = () => {
-    if (preferences) setDraftPreferences({ searchRadius: preferences.searchRadius });
-    setDialogOpen(false);
+  const startEditNote = (note: MealNote) => {
+    if (!note.id) return;
+    setEditingNoteId(note.id);
+    setNoteText(note.notes);
+    setNoteRating(note.rating);
   };
 
-  const savedGoogleDetails = googleDetails && googleDetails.placeId === currentSelected?.id ? googleDetails.data : null;
-  const displayedRating = savedGoogleDetails?.rating ?? currentSelected?.rating ?? 0;
-  const displayedUserRatingCount = savedGoogleDetails?.userRatingCount ?? currentSelected?.userRatingCount ?? 0;
+  const cancelEditNote = () => {
+    setEditingNoteId(null);
+    setNoteText('');
+    setNoteRating(0);
+  };
+
+  const deleteNote = async (noteId?: number) => {
+    if (!noteId || !currentSelected) return;
+    await db.notes.delete(noteId);
+    if (editingNoteId === noteId) cancelEditNote();
+    const updatedNotes = await db.notes.where('placeId').equals(currentSelected.id).toArray();
+    setNotesHistory((updatedNotes as MealNote[]).sort((a, b) => b.updatedAt - a.updatedAt));
+  };
+
+  const currentRegion = userLocation ? getDataRegion(userLocation.lat, userLocation.lng) : 'global';
+  const displayedRating = currentSelected?.rating ?? 0;
+  const displayedUserRatingCount = currentSelected?.userRatingCount ?? 0;
   const displayedPrice = currentSelected?.source === 'google'
-    ? formatPriceLevel(savedGoogleDetails?.priceLevel)
+    ? formatPriceLevel(currentSelected?.priceLevel || currentSelected?.price)
     : currentSelected?.price;
 
-  // 使用 useMemo 快取加工後的候選池，確保效能與響應速度
   const processedCandidates = useMemo(() => {
     return candidates.map((item) => {
       const dist = userLocation && item.lat && item.lng
@@ -464,6 +537,7 @@ const handleNextTime = async () => {
         : null;
       return {
         ...item,
+        type: formatCategory(item.type),
         calculatedDistance: dist,
         isFav: favoriteIds.has(item.id),
       };
@@ -477,143 +551,188 @@ const handleNextTime = async () => {
   }, [candidates, userLocation, favoriteIds]);
 
   return (
-    <main className="min-h-screen bg-[#f5f6f2] px-4 py-5 text-[#202720] sm:px-6">
-      <div className="mx-auto flex min-h-[calc(100svh-2.5rem)] w-full max-w-xl flex-col">
+    <main className="min-h-screen bg-[#f7f8f4] dark:bg-[#101613] px-4 py-6 text-[#1d241e] dark:text-[#edf2ed] transition-colors duration-200 sm:px-6">
+      <div className="mx-auto flex min-h-[calc(100svh-3rem)] w-full max-w-xl flex-col">
         {/* Header 頂部欄 */}
-        <header className="flex items-start justify-between">
+        <header className="flex items-center justify-between pb-3">
           <div>
-            <p className="text-xs font-semibold uppercase tracking-[0.16em] text-[#64715f]">FATBUDDY / NEARBY</p>
-            <h1 className="mt-1 text-xl font-bold text-[#202720]">今天吃什麼？</h1>
+            <p className="text-[10px] font-extrabold uppercase tracking-[0.2em] text-[#6b7a66] dark:text-[#88a385]">FATBUDDY / NEARBY</p>
+            <h1 className="mt-0.5 text-2xl font-black tracking-tight text-[#162118] dark:text-[#eaf2ea]">今天吃什麼？</h1>
           </div>
           
-          <div className="flex flex-col items-center gap-2">
+          <div className="flex items-center gap-2">
             <button
               type="button"
               onClick={() => openManagementView('settings')}
-              className="grid size-10 cursor-pointer place-items-center rounded-full border border-[#d9ded4] bg-white text-[#344434] shadow-sm transition-all duration-150 ease-in-out hover:scale-105 hover:border-[#263d30] hover:bg-[#f0f4ee] hover:text-[#263d30] active:scale-95"
+              className="grid size-10 cursor-pointer place-items-center rounded-2xl border border-[#dfe4d8] dark:border-[#25352b] bg-white dark:bg-[#17211b] text-[#344434] dark:text-[#d0ded0] shadow-xs transition-all duration-150 hover:scale-105 active:scale-95"
               aria-label="搜尋設定"
             >
-              <Settings className="size-5" />
+              <Settings className="size-4.5" />
             </button>
 
             <button
               type="button"
               onClick={() => openManagementView('exclusions')}
-              className="grid size-10 cursor-pointer place-items-center rounded-full border border-[#d9ded4] bg-white text-[#344434] shadow-sm transition-all duration-150 ease-in-out hover:scale-105 hover:border-[#263d30] hover:bg-[#f0f4ee] hover:text-[#263d30] active:scale-95"
+              className="relative grid size-10 cursor-pointer place-items-center rounded-2xl border border-[#dfe4d8] dark:border-[#25352b] bg-white dark:bg-[#17211b] text-[#344434] dark:text-[#d0ded0] shadow-xs transition-all duration-150 hover:scale-105 active:scale-95"
               aria-label="臨時排除"
             >
-              <Clock3 className="size-5" />
+              <Clock3 className="size-4.5" />
+              {tempExclusionCount > 0 && (
+                <span className="absolute -right-1 -top-1 flex h-4 min-w-4 items-center justify-center rounded-full bg-[#c34f54] px-1 text-[9px] font-bold text-white shadow-xs">
+                  {formatBadgeCount(tempExclusionCount)}
+                </span>
+              )}
             </button>
 
             <button
               type="button"
               onClick={() => openManagementView('participants')}
-              className="relative grid size-10 cursor-pointer place-items-center rounded-full border border-[#d9ded4] bg-white text-[#344434] shadow-sm transition-all duration-150 ease-in-out hover:scale-105 hover:border-[#263d30] hover:bg-[#f0f4ee] hover:text-[#263d30] active:scale-95"
+              className="relative grid size-10 cursor-pointer place-items-center rounded-2xl border border-[#dfe4d8] dark:border-[#25352b] bg-white dark:bg-[#17211b] text-[#344434] dark:text-[#d0ded0] shadow-xs transition-all duration-150 hover:scale-105 active:scale-95"
               aria-label="參與抽選列表"
             >
-              <ListChecks className="size-5" />
+              <ListChecks className="size-4.5" />
               {candidates.length > 0 && (
-                <span className="absolute -right-1 -top-1 flex size-4 items-center justify-center rounded-full bg-[#263d30] text-[10px] font-bold text-white">
-                  {candidates.length > 999 ? '999+' : candidates.length}
+                <span className="absolute -right-1 -top-1 flex h-4 min-w-4 items-center justify-center rounded-full bg-[#263d30] dark:bg-[#3d5746] px-1 text-[9px] font-bold text-white shadow-xs">
+                  {formatBadgeCount(candidates.length)}
                 </span>
               )}
             </button>
           </div>
         </header>
 
-        {/* 轉盤主要區域 */}
-        <section className="flex flex-1 flex-col items-center justify-center py-5">
-          <div className="mb-1 flex min-h-6 items-center gap-2 text-sm text-[#64715f]">
-            {isRefreshing ? <RotateCw className="size-4 animate-spin" /> : <MapPin className="size-4" />}
-            <span>{isRefreshing ? '正在背景更新附近餐廳' : `${preferences?.searchRadius ?? 500} 公尺內`}</span>
-          </div>
+        {/* 輪盤主區域 */}
+        <section className="flex flex-1 flex-col items-center justify-center py-2">
           {isLoading ? (
-            <div className="grid min-h-[230px] place-items-center text-sm text-[#64715f]">正在搜尋附近餐廳…</div>
+            <div className="grid min-h-[260px] place-items-center text-sm font-medium text-[#6b7a66] dark:text-[#9eb09a] animate-pulse">正在搜尋附近餐廳…</div>
           ) : candidates.length === 0 ? (
-            <div className="grid min-h-[230px] max-w-sm place-items-center text-center">
+            <div className="grid min-h-[260px] max-w-sm place-items-center text-center">
               <div>
-                <p className="font-semibold">{errorMessage ? '目前無法開始抽選' : '附近沒有其他選擇'}</p>
-                <p className="mt-2 text-sm leading-6 text-[#64715f]">{errorMessage || '試著擴大搜尋半徑，或稍後重新搜尋。'}</p>
-                <button type="button" onClick={() => openManagementView('settings')} className="mt-4 cursor-pointer rounded-full bg-[#263d30] px-4 py-2 text-sm font-semibold text-white transition-all duration-150 hover:scale-105 active:scale-95">調整搜尋設定</button>
+                <p className="font-bold text-base">{errorMessage ? '目前無法開始抽選' : '附近沒有餐廳'}</p>
+                <p className="mt-1.5 text-xs leading-relaxed text-[#6b7a66] dark:text-[#9eb09a]">{errorMessage || '試著在設定中調大搜尋半徑。'}</p>
+                <button type="button" onClick={() => openManagementView('settings')} className="mt-4 cursor-pointer rounded-full bg-[#263d30] dark:bg-[#3d5746] px-5 py-2.5 text-xs font-bold text-white shadow-sm transition-all hover:scale-105 active:scale-95">調整搜尋設定</button>
               </div>
             </div>
           ) : (
             <Roulette key={spinId} candidates={processedCandidates} autoStart onFinish={updateSelection} />
           )}
-          {errorMessage && !isLoading && <p role="status" className="mt-2 max-w-sm text-center text-xs text-[#80604a]">{errorMessage}</p>}
+
+          {/* 距離標籤：完美置於輪盤下方，視覺重心極佳 */}
+          {!isLoading && candidates.length > 0 && (
+            <div className="mt-3.5 inline-flex items-center gap-2 rounded-full border border-[#dfe4d8] dark:border-[#25352b] bg-white/80 dark:bg-[#16201a]/80 px-4 py-1.5 text-xs font-bold text-[#4a5c47] dark:text-[#9bb398] shadow-xs backdrop-blur-xs">
+              {isRefreshing ? <RotateCw className="size-3.5 animate-spin" /> : <MapPin className="size-3.5 text-[#263d30] dark:text-[#88c298]" />}
+              <span>{isRefreshing ? '背景更新中' : `${preferences?.searchRadius ?? 500} 公尺內`}</span>
+            </div>
+          )}
+
+          {errorMessage && !isLoading && <p role="status" className="mt-2 text-center text-xs text-[#c34f54] dark:text-[#e07579]">{errorMessage}</p>}
         </section>
 
-        {/* 當前選中餐廳資訊卡片 */}
+        {/* 選中餐廳精緻卡片 */}
         {currentSelected && preferences && (
-          <section className="mt-4 mb-2 rounded-2xl border border-[#dce1d7] bg-white p-4 shadow-sm">
-            <div className="flex items-start justify-between gap-3">
-              <div className="min-w-0">
-                <p className="text-xs font-semibold text-[#64715f]">就吃這家</p>
-                <h2 className="mt-1 break-words text-xl font-bold text-[#202720]">{currentSelected.name}</h2>
-                <p className="mt-1 text-sm text-[#64715f]">{currentSelected.address || '地址資訊未提供'}</p>
-                <p className="mt-1 text-sm text-[#916229]">
-                  {typeof displayedUserRatingCount === 'number' && displayedUserRatingCount > 0 && (
-                    <span>{displayedUserRatingCount} 人參與評分 · </span>
+          <section className="mt-2 mb-3 rounded-3xl border border-[#dfe4d8] dark:border-[#25352b] bg-white dark:bg-[#16201a] p-5 shadow-xl shadow-black/5">
+            <div className="flex items-start justify-between gap-4">
+              <div className="min-w-0 flex-1 text-left">
+                <span className="inline-block rounded-full bg-[#eef3ec] dark:bg-[#223328] px-2.5 py-0.5 text-[10px] font-extrabold tracking-wider uppercase text-[#395237] dark:text-[#9ac497]">就吃這家</span>
+                <h2 className="mt-1.5 break-words text-xl font-black tracking-tight text-[#162118] dark:text-[#eaf2ea]">{currentSelected.name}</h2>
+                <p className="mt-1 break-words text-xs leading-relaxed text-[#6b7a66] dark:text-[#98aba6]">{currentSelected.address || '地址資訊未提供'}</p>
+                
+                <div className="mt-2.5 flex flex-wrap items-center gap-2 text-xs">
+                  {displayedRating > 0 ? (
+                    <span className="font-bold text-[#b88228] dark:text-[#e6b363]">
+                      ★ {displayedRating.toFixed(1)}
+                      {typeof displayedUserRatingCount === 'number' && displayedUserRatingCount > 0 && (
+                        <span className="ml-1 text-[11px] font-normal text-[#879083]">({displayedUserRatingCount})</span>
+                      )}
+                    </span>
+                  ) : (
+                    <span className="text-[11px] text-[#879083]">尚無評分</span>
                   )}
-                  {displayedRating > 0 ? `★ ${displayedRating.toFixed(1)}` : '尚無評分'}
-                </p>
-                {currentSelected.type && <p className="mt-1 text-sm text-[#64715f]">類別：{currentSelected.type}</p>}
-                {displayedPrice && <p className="mt-1 text-sm text-[#64715f]">人均/價格參考：{displayedPrice}</p>}
-                {currentSelected.googlePlaceId && !savedGoogleDetails && (
-                  <button type="button" onClick={loadGoogleDetails} disabled={isLoadingDetails} className="mt-2 cursor-pointer rounded-lg border border-[#d9ded4] px-3 py-2 text-xs font-semibold text-[#344434] transition-all duration-150 hover:scale-105 active:scale-95 disabled:opacity-50">
-                    {isLoadingDetails ? '載入資料…' : '載入 Google 評分與價格'}
+
+                  {displayedPrice && (
+                    <span className="rounded-md bg-[#f4eee4] dark:bg-[#332b20] px-2 py-0.5 text-[11px] font-bold text-[#8a611c] dark:text-[#e0b263]">
+                      {displayedPrice}
+                    </span>
+                  )}
+
+                  {currentSelected.type && (
+                    <span className="rounded-md bg-[#eef3ec] dark:bg-[#223328] px-2 py-0.5 text-[11px] font-medium text-[#445c42] dark:text-[#a0c49f]">
+                      {formatCategory(currentSelected.type)}
+                    </span>
+                  )}
+                </div>
+
+                {(currentSelected.phone || currentSelected.openingHours) && (
+                  <div className="mt-2.5 space-y-1 border-t border-[#f2f4ee] dark:border-[#202c25] pt-2 text-xs text-[#6b7a66] dark:text-[#98aba6]">
+                    {currentSelected.phone && <p>電話：{currentSelected.phone}</p>}
+                    {currentSelected.openingHours && <p>營業時間：{currentSelected.openingHours}</p>}
+                  </div>
+                )}
+              </div>
+
+              <a
+                href={getSmartNavUrl(currentSelected, currentRegion)}
+                target="_blank"
+                rel="noreferrer"
+                onClick={() => handleNavClick(currentSelected)}
+                title="開啟地圖導航"
+                aria-label="開啟地圖導航"
+                className="grid size-11 shrink-0 cursor-pointer place-items-center rounded-2xl bg-[#263d30] dark:bg-[#3d5746] text-white shadow-md transition-all duration-150 hover:scale-105 active:scale-95"
+              >
+                <Navigation className="size-5" />
+              </a>
+            </div>
+
+            {/* 食記與評論區 */}
+            <div className="mt-4 border-t border-[#f2f4ee] dark:border-[#202c25] pt-3.5">
+              <div className="flex items-center justify-between text-xs font-bold">
+                <label htmlFor="meal-note" className="flex items-center gap-1.5 text-[#1d241e] dark:text-[#edf2ed]">
+                  <NotebookPen className="size-3.5 text-[#526950] dark:text-[#88ab86]" />
+                  {editingNoteId ? '編輯評論' : '我的評論'}
+                </label>
+                {editingNoteId && (
+                  <button type="button" onClick={cancelEditNote} className="inline-flex items-center gap-1 text-[11px] text-[#879083] hover:underline">
+                    <X className="size-3" /> 取消
                   </button>
                 )}
               </div>
-              <nav aria-label="選擇導航地圖" className="flex shrink-0 flex-col gap-2">
-                {getNavigationLinks(currentSelected).map((link) => (
-                  <a key={link.name} href={link.url} target="_blank" rel="noreferrer" className="inline-flex cursor-pointer items-center gap-1.5 rounded-full bg-[#263d30] px-3.5 py-2 text-xs font-semibold text-white shadow-sm transition-all duration-150 hover:scale-105 active:scale-95">
-                    <Navigation className="size-4" />{link.name}
-                  </a>
-                ))}
-              </nav>
-            </div>
-
-            {/* 我的評論與歷史評論記錄 */}
-            <div className="mt-4 border-t border-[#e8ebe5] pt-3">
-              <label htmlFor="meal-note" className="flex items-center gap-2 text-sm font-semibold">
-                <NotebookPen className="size-4 text-[#526950]" /> 我的評論
-              </label>
+              
               <textarea
                 id="meal-note"
                 value={noteText}
                 onChange={(event) => setNoteText(event.target.value)}
                 rows={2}
                 maxLength={500}
-                placeholder="分享這次用餐體驗"
-                className="mt-2 w-full resize-y rounded-xl border border-[#d9ded4] bg-[#fbfcfa] p-3 text-sm outline-none focus:border-[#607c61]"
+                placeholder="記錄這次的用餐心得與評分…"
+                className="mt-2 w-full resize-y rounded-2xl border border-[#dfe4d8] dark:border-[#25352b] bg-[#fafbfa] dark:bg-[#121a15] p-3 text-xs text-[#1d241e] dark:text-[#edf2ed] placeholder-[#879083] outline-none focus:border-[#425e40]"
               />
               <div className="mt-2 flex flex-wrap items-center justify-between gap-2">
-                <div className="flex items-center gap-1" aria-label="評論評分">
+                <div className="flex items-center gap-1" aria-label="評分">
                   {[1, 2, 3, 4, 5].map((rating) => (
-                    <button key={rating} type="button" onClick={() => setNoteRating(rating)} className={`size-8 cursor-pointer text-lg transition-all duration-150 hover:scale-125 ${rating <= noteRating ? 'text-[#d69a34]' : 'text-[#cbd1c8]'}`} aria-label={`${rating} 分`}>
+                    <button key={rating} type="button" onClick={() => setNoteRating(rating)} className={`size-7 cursor-pointer text-base transition-all hover:scale-125 ${rating <= noteRating ? 'text-[#d69a34]' : 'text-[#cbd1c8] dark:text-[#2d3b32]'}`} aria-label={`${rating}分`}>
                       ★
                     </button>
                   ))}
                 </div>
-                <button type="button" onClick={saveNote} disabled={!noteText.trim() || noteRating < 1 || isSavingNote} className="cursor-pointer rounded-full border border-[#cdd5c8] bg-white px-4 py-1.5 text-sm font-semibold text-[#344434] transition-all duration-150 hover:scale-105 active:scale-95 disabled:cursor-not-allowed disabled:opacity-40">
-                  {isSavingNote ? '發布中…' : '發布評論'}
+                <button type="button" onClick={saveNote} disabled={!noteText.trim() || noteRating < 1 || isSavingNote} className="cursor-pointer rounded-full border border-[#dfe4d8] dark:border-[#25352b] bg-white dark:bg-[#17211b] px-3.5 py-1.5 text-xs font-bold text-[#344434] dark:text-[#e0ebe0] transition-all hover:scale-105 disabled:opacity-40">
+                  {isSavingNote ? '儲存中…' : editingNoteId ? '更新評論' : '發布評論'}
                 </button>
               </div>
 
               {notesHistory.length > 0 && (
-                <div className="mt-4 space-y-2.5 border-t border-[#f0f2ee] pt-3">
-                  <p className="text-xs font-semibold text-[#64715f]">過往評論 ({notesHistory.length})</p>
-                  <div className="max-h-48 space-y-2 overflow-y-auto pr-1">
+                <div className="mt-3 space-y-2 border-t border-[#f2f4ee] dark:border-[#202c25] pt-3">
+                  <p className="text-[11px] font-bold text-[#6b7a66] dark:text-[#9eb09a]">過往食記 ({notesHistory.length})</p>
+                  <div className="max-h-36 space-y-2 overflow-y-auto pr-1">
                     {notesHistory.map((note) => (
-                      <div key={note.id ?? note.publishedAt} className="rounded-xl border border-[#eef1eb] bg-[#f8faf7] p-3 text-xs">
-                        <div className="flex items-center justify-between text-[#916229]">
-                          <span className="font-semibold">{'★'.repeat(note.rating)}</span>
-                          <span className="text-[10px] text-[#879083]">
-                            {new Date(note.publishedAt).toLocaleDateString()}
-                          </span>
+                      <div key={note.id ?? note.publishedAt} className="rounded-2xl border border-[#eef3ec] dark:border-[#243329] bg-[#f8faf7] dark:bg-[#141d18] p-3 text-xs text-left">
+                        <div className="flex items-center justify-between text-[#916229] dark:text-[#e0aa53]">
+                          <span className="font-bold">{'★'.repeat(note.rating)}</span>
+                          <div className="flex items-center gap-2">
+                            <span className="text-[10px] text-[#879083]">{new Date(note.publishedAt ?? note.updatedAt).toLocaleDateString()}</span>
+                            <button type="button" onClick={() => startEditNote(note)} title="編輯" className="text-[#526950] hover:scale-110"><Pencil className="size-3.5" /></button>
+                            <button type="button" onClick={() => void deleteNote(note.id)} title="刪除" className="text-[#c34f54] hover:scale-110"><Trash2 className="size-3.5" /></button>
+                          </div>
                         </div>
-                        <p className="mt-1.5 whitespace-pre-line leading-relaxed text-[#344434]">{note.notes}</p>
+                        <p className="mt-1 whitespace-pre-line leading-relaxed text-[#344434] dark:text-[#d0ded0]">{note.notes}</p>
                       </div>
                     ))}
                   </div>
@@ -621,14 +740,14 @@ const handleNextTime = async () => {
               )}
             </div>
 
-            {/* 卡片底端按鈕列 */}
-            <div className="mt-3 flex flex-wrap items-center justify-between gap-2 border-t border-[#e8ebe5] pt-3">
-              <button type="button" onClick={toggleFavorite} aria-pressed={isFavorite} className={`inline-flex cursor-pointer items-center gap-1.5 px-2 py-2 text-xs transition-all duration-150 hover:scale-105 active:scale-95 ${isFavorite ? 'font-bold text-[#c34f54]' : 'text-[#78655b]'}`}>
-                <Heart className={`size-4 ${isFavorite ? 'fill-current' : ''}`} />{isFavorite ? '已收藏' : '收藏餐廳'}
+            {/* 底部按鈕列 */}
+            <div className="mt-3 flex flex-wrap items-center justify-between gap-2 border-t border-[#f2f4ee] dark:border-[#202c25] pt-3">
+              <button type="button" onClick={toggleFavorite} aria-pressed={isFavorite} className={`inline-flex cursor-pointer items-center gap-1 px-2 py-1.5 text-xs font-medium transition-all hover:scale-105 ${isFavorite ? 'font-bold text-[#c34f54]' : 'text-[#6b7a66] dark:text-[#98aba6]'}`}>
+                <Heart className={`size-4 ${isFavorite ? 'fill-current' : ''}`} />{isFavorite ? '已收藏' : '收藏'}
               </button>
-              <button type="button" onClick={handleBlacklist} className="inline-flex cursor-pointer items-center gap-1.5 px-2 py-2 text-xs text-[#78655b] transition-all duration-150 hover:scale-105 active:scale-95"><ShieldBan className="size-4" />永久排除</button>
-              <button type="button" onClick={handleReroll} className="inline-flex cursor-pointer items-center gap-2 rounded-full border border-[#cdd5c8] bg-white px-3.5 py-2 text-sm font-semibold text-[#344434] transition-all duration-150 hover:scale-105 active:scale-95"><RotateCw className="size-4" />直接再轉</button>
-              <button type="button" onClick={handleNextTime} className="inline-flex cursor-pointer items-center gap-2 rounded-full bg-[#e9eee6] px-4 py-2 text-sm font-semibold text-[#344434] transition-all duration-150 hover:scale-105 active:scale-95"><RotateCw className="size-4" />排除此店再轉</button>
+              <button type="button" onClick={handleBlacklist} className="inline-flex cursor-pointer items-center gap-1 px-2 py-1.5 text-xs font-medium text-[#6b7a66] dark:text-[#98aba6] hover:scale-105"><ShieldBan className="size-4" />永久排除</button>
+              <button type="button" onClick={handleReroll} className="inline-flex cursor-pointer items-center gap-1.5 rounded-full border border-[#dfe4d8] dark:border-[#25352b] bg-white dark:bg-[#17211b] px-3.5 py-1.5 text-xs font-bold text-[#344434] dark:text-[#e0ebe0] transition-all hover:scale-105"><RotateCw className="size-3.5" />再轉一次</button>
+              <button type="button" onClick={handleNextTime} className="inline-flex cursor-pointer items-center gap-1.5 rounded-full bg-[#eef3ec] dark:bg-[#223328] px-4 py-1.5 text-xs font-bold text-[#344434] dark:text-[#c0d4c0] transition-all hover:scale-105"><RotateCw className="size-3.5" />排除此店</button>
             </div>
           </section>
         )}
@@ -645,13 +764,13 @@ const handleNextTime = async () => {
           setDraftPreferences={setDraftPreferences}
           candidates={processedCandidates}
           allCandidates={allCandidates}
-          radiusPreviewCount={radiusPreviewCount}
-          isPreviewingRadius={isPreviewingRadius}
-          radiusPreviewError={radiusPreviewError}
+          rawCandidates={rawCandidatesRef.current}
+          userLocation={userLocation}
           initialView={dialogView}
           onSavePreferences={savePreferences}
-          onClose={closeDialog}
+          onClose={() => setDialogOpen(false)}
           onRefreshCandidates={refreshCandidates}
+          onNavClick={handleNavClick}
         />
       )}
     </main>

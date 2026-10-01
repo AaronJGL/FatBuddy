@@ -44,24 +44,27 @@ const wrapText = (text: string, maxWidth: number, context: CanvasRenderingContex
 export interface Restaurant {
   id: string;
   name: string;
-  lat?: number;
-  lng?: number;
+  lat: number;
+  lng: number;
   rating?: number;
   userRatingCount?: number;
-  address?: string;
+  address: string;
   type?: string;
   price?: string;
   priceLevel?: string;
   licenseType?: string;
-  dataUpdatedAt?: string;
-  source?: 'google' | 'amap' | 'fehd' | 'osm';
+  phone?: string;
+  openingHours?: string;
+  googleMapsUri?: string;
+  dataUpdatedAt?: number;
+  isInactive?: boolean;
+  source: 'google' | 'fehd' | 'amap';
+
   googlePlaceId?: string;
   amapPoiId?: string;
   fehdObjectId?: string;
-  osmId?: string;
-  sources?: Array<'google' | 'amap' | 'fehd' | 'osm'>;
+  sources?: Array<'google' | 'fehd' | 'amap'>;
 }
-
 interface RouletteProps {
   candidates: Restaurant[];
   autoStart?: boolean;
