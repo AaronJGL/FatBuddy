@@ -3,9 +3,9 @@
  * https://developers.cloudflare.com/workers/wrangler/configuration/
  */
 {
-	"$schema": "node_modules/wrangler/config-schema.json",
+	"$schema": "server/node_modules/wrangler/config-schema.json",
 	"name": "server",
-	"main": "src/index.ts",
+	"main": "server/src/index.ts",
 	"compatibility_date": "2026-09-26",
 	"kv_namespaces": [
 		{
@@ -13,6 +13,10 @@
 			"id": "fdc31dd9eb5549109cdb0709999b2a52"
 		}
 	],
+	"assets": {
+		"directory": "./dist",
+		"binding": "ASSETS"
+	},
 	"observability": {
 		"enabled": true
 	},
