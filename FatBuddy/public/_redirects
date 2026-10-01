@@ -1,0 +1,1 @@
+/api/*  https://server.fatbuddy.workers.dev/api/:splat  200
