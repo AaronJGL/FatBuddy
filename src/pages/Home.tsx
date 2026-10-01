@@ -404,6 +404,7 @@ export const HomePage = () => {
 
   const savedGoogleDetails = googleDetails && googleDetails.placeId === currentSelected?.id ? googleDetails.data : null;
   const displayedRating = savedGoogleDetails?.rating ?? currentSelected?.rating ?? 0;
+  const displayedUserRatingCount = savedGoogleDetails?.userRatingCount ?? currentSelected?.userRatingCount ?? 0;
   const displayedPrice = currentSelected?.source === 'google'
     ? formatPriceLevel(savedGoogleDetails?.priceLevel)
     : currentSelected?.price;
@@ -469,7 +470,15 @@ export const HomePage = () => {
                 <p className="text-xs font-semibold text-[#64715f]">就吃這家</p>
                 <h2 className="mt-1 break-words text-xl font-bold">{currentSelected.name}</h2>
                 <p className="mt-1 text-sm text-[#64715f]">{currentSelected.address || '地址資訊未提供'}</p>
-                <p className="mt-1 text-sm text-[#916229]">{displayedRating > 0 ? `★ ${displayedRating.toFixed(1)}` : '尚無評分'}</p>
+                <p className="mt-1 text-sm text-[#916229]">
+                  {/* 確保是整數才顯示評分人數 */}
+                  {typeof displayedUserRatingCount === 'number' && displayedUserRatingCount > 0 && (
+                    <span>{displayedUserRatingCount} 人參與評分 · </span>
+                  )}
+                  
+                  {/* 星級評分 */}
+                  {displayedRating > 0 ? `★ ${displayedRating.toFixed(1)}` : '尚無評分'}
+                </p>
                 {currentSelected.type && <p className="mt-1 text-sm text-[#64715f]">類別：{currentSelected.type}</p>}
                 {displayedPrice && <p className="mt-1 text-sm text-[#64715f]">人均/價格參考：{displayedPrice}</p>}
                 {currentSelected.source === 'google' && !savedGoogleDetails && (

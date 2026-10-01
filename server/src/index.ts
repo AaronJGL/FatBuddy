@@ -1,18 +1,21 @@
 import ngeohash from 'ngeohash';
-import OpenCC from 'opencc-js/t2cn';
+import * as OpenCC from 'opencc-js';
 
 const CACHE_TTL_SECONDS = 60 * 60 * 24;
 const DEFAULT_RADIUS_METERS = 1000;
 const MAX_RESULTS = 20;
 const FEHD_RESULT_LIMIT = 1000;
 const FEHD_QUERY_URL = 'https://portal.csdi.gov.hk/server/rest/services/common/fehd_rcd_1630036390312_58893/FeatureServer/0/query';
-const DEFAULT_OVERPASS_URL = 'https://overpass-api.de/api/interpreter';
-const OSM_QUERY_TIMEOUT_SECONDS = 2;
-const OSM_REQUEST_TIMEOUT_MS = 2500;
+
+// 優先使用回應速度較快、對亞洲區友好的 Overpass 鏡像站
+const DEFAULT_OVERPASS_URL = 'https://overpass.kumi.systems/api/interpreter';
+//const DEFAULT_OVERPASS_URL = 'https://overpass-api.de/api/interpreter';
+const OSM_QUERY_TIMEOUT_SECONDS = 8;
+const OSM_REQUEST_TIMEOUT_MS = 8000;
 const OSM_RESULT_LIMIT = 100;
 const AMAP_RESULT_LIMIT = 25;
-const toSimplifiedChinese = OpenCC.Converter({ from: 'tw', to: 'cn' });
-
+//const toSimplifiedChinese = OpenCC.Converter({ from: 'tw', to: 'cn' });
+const toSimplifiedChinese = OpenCC.Converter({ from: 'hk', to: 'cn' });
 type DataRegion = 'hk' | 'cn' | 'global';
 
 export interface Env {
@@ -28,15 +31,22 @@ export interface Restaurant {
   name: string;
   lat: number;
   lng: number;
-  rating: number;
+  rating: number; // 來自 Google 或 高德
+  userRatingCount?: number; // 來自 Google
   address: string;
-  source: 'google' | 'amap' | 'fehd' | 'osm';
-  type?: string;
-  price?: string;
-  priceLevel?: string;
-  userRatingCount?: number;
+  type?: string; // 菜式種類
+  price?: string; // 來自 高德 (cost) 或 Google (priceLevel)
+  priceLevel?: string; // 來自 高德 (cost) 或 Google (priceLevel)
   licenseType?: string;
   dataUpdatedAt?: string;
+  source: 'google' | 'amap' | 'fehd' | 'osm';
+
+  // 保存原本各源的原始 ID，方便追蹤與後續查詢
+  googlePlaceId?: string; 
+  amapPoiId?: string;
+  fehdObjectId?: string;
+  osmId?: string;
+  sources?: Array<'google' | 'amap' | 'fehd' | 'osm'>; // 記錄融合了哪些來源
 }
 
 interface PlacesResponse {
@@ -50,6 +60,7 @@ interface GooglePlace {
   displayName?: { text?: string };
   location?: { latitude?: number; longitude?: number };
   rating?: number;
+  userRatingCount?: number;
   formattedAddress?: string;
   primaryType?: string;
   primaryTypeDisplayName?: { text?: string };
@@ -172,6 +183,22 @@ function toAmapCoordinates(lat: number, lng: number): { lat: number; lng: number
   return { lat: magic, lng: lng + deltaLng };
 }
 
+// AmapCoordinates GCJ-02 (火星座標) 轉 Google Map WGS-84 座標轉換函式
+function gcj02ToWgs84(lng: number, lat: number): { lat: number; lng: number } {
+  if (lng < 72.004 || lng > 137.8347 || lat < 0.8293 || lat > 55.8271) return { lat, lng };
+  const a = 6378245.0;
+  const ee = 0.006693421622965943;
+  let dLat = transformLatitude(lng - 105.0, lat - 35.0);
+  let dLng = transformLongitude(lng - 105.0, lat - 35.0);
+  const radLat = (lat / 180.0) * Math.PI;
+  let magic = Math.sin(radLat);
+  magic = 1 - ee * magic * magic;
+  const sqrtMagic = Math.sqrt(magic);
+  dLat = (dLat * 180.0) / (((a * (1 - ee)) / (magic * sqrtMagic)) * Math.PI);
+  dLng = (dLng * 180.0) / ((a / sqrtMagic) * Math.cos(radLat) * Math.PI);
+  return { lat: lat - dLat, lng: lng - dLng };
+}
+
 async function fetchGooglePlaces(
   lat: number,
   lng: number,
@@ -202,6 +229,7 @@ async function fetchGooglePlaces(
   return (result.places ?? []).flatMap((place): Restaurant[] => {
     const placeLat = place.location?.latitude;
     const placeLng = place.location?.longitude;
+    const placeRating = normalizeRating(place.rating);
     const name = place.displayName?.text?.trim();
     if (!place.id || !name || !Number.isFinite(placeLat) || !Number.isFinite(placeLng)) return [];
 
@@ -210,10 +238,13 @@ async function fetchGooglePlaces(
       name,
       lat: placeLat!,
       lng: placeLng!,
-      rating: 0,
+      rating: placeRating,
+      userRatingCount: place.userRatingCount,
       address: place.formattedAddress ?? '',
       source: 'google',
       type: place.primaryTypeDisplayName?.text ?? place.primaryType,
+      googlePlaceId: place.id,
+      sources: ['google'],
     }];
   });
 }
@@ -264,17 +295,20 @@ async function fetchAmapPlaces(
     const poiLng = Number(lngText);
     const name = poi.name?.trim();
     if (!poi.id || !name || !Number.isFinite(poiLat) || !Number.isFinite(poiLng)) return [];
-
+    // 將高德 GCJ-02 座標轉回 WGS-84
+    const wgsCoords = gcj02ToWgs84(poiLng, poiLat);
     return [{
       id: `amap:${poi.id}`,
       name,
-      lat: poiLat,
-      lng: poiLng,
+      lat: wgsCoords.lat,
+      lng: wgsCoords.lng,
       rating: normalizeRating(poi.biz_ext?.rating),
       address: Array.isArray(poi.address) ? poi.address.join('') : poi.address ?? '',
       source: 'amap',
       type: poi.type,
       price: poi.biz_ext?.cost === undefined ? undefined : String(poi.biz_ext.cost),
+      amapPoiId: poi.id,
+      sources: ['amap'],
     }];
   });
 }
@@ -335,9 +369,66 @@ async function fetchFehdPlaces(lat: number, lng: number, radius: number): Promis
       source: 'fehd',
       licenseType: attributes.NAME_TC?.trim() || attributes.NAME_EN?.trim() || undefined,
       dataUpdatedAt: attributes.LASTUPDATE?.trim() || undefined,
+      fehdObjectId: String(attributes.OBJECTID),
+      sources: ['fehd'],
     }];
   });
 }
+
+// async function fetchOsmPlaces(
+//   lat: number,
+//   lng: number,
+//   radius: number,
+//   endpoint: string,
+// ): Promise<Restaurant[]> {
+//   const boundedRadius = Math.min(radius, 5000);
+//   const query = [
+//     `[out:json][timeout:${OSM_QUERY_TIMEOUT_SECONDS}];`,
+//     `nwr(around:${boundedRadius},${lat},${lng})["amenity"~"^(restaurant|fast_food|cafe|food_court)$"];`,
+//     `out center ${OSM_RESULT_LIMIT};`,
+//   ].join('\n');
+//   const body = new URLSearchParams({ data: query });
+//   const response = await fetch(endpoint, {
+//     method: 'POST',
+//     headers: {
+//       'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8',
+//       'User-Agent': 'FatBuddy/1.0',
+//     },
+//     body,
+//     signal: AbortSignal.timeout(OSM_REQUEST_TIMEOUT_MS),
+//   });
+
+//   if (!response.ok) throw new Error(`Overpass returned ${response.status}`);
+//   const result = await response.json() as { elements?: OsmElement[] };
+
+//   return (result.elements ?? []).flatMap((element): Restaurant[] => {
+//     const tags = element.tags;
+//     const placeLat = element.lat ?? element.center?.lat;
+//     const placeLng = element.lon ?? element.center?.lon;
+//     const name = tags?.['name:zh-Hant']
+//       || tags?.['name:zh']
+//       || tags?.name
+//       || tags?.['name:en']
+//       || tags?.brand;
+//     if (!element.type || !element.id || !name || !Number.isFinite(placeLat) || !Number.isFinite(placeLng)) return [];
+
+//     const address = tags?.['addr:full']
+//       || [tags?.['addr:housenumber'], tags?.['addr:street'], tags?.['addr:city']].filter(Boolean).join(' ');
+//     return [{
+//       id: `osm:${element.type}:${element.id}`,
+//       name,
+//       lat: placeLat!,
+//       lng: placeLng!,
+//       rating: 0,
+//       address,
+//       source: 'osm',
+//       type: tags?.cuisine || tags?.amenity,
+//       price: tags?.price_range,
+//       osmId: `${element.type}:${element.id}`, // 例如 "node:123456"
+//       sources: ['osm'],
+//     }];
+//   });
+// }
 
 async function fetchOsmPlaces(
   lat: number,
@@ -346,71 +437,150 @@ async function fetchOsmPlaces(
   endpoint: string,
 ): Promise<Restaurant[]> {
   const boundedRadius = Math.min(radius, 5000);
-  const query = [
-    `[out:json][timeout:${OSM_QUERY_TIMEOUT_SECONDS}];`,
-    `nwr(around:${boundedRadius},${lat},${lng})["amenity"~"^(restaurant|fast_food|cafe|food_court)$"];`,
-    `out center ${OSM_RESULT_LIMIT};`,
-  ].join('\n');
+  
+  // 標準且相容性高的 Overpass QL 寫法
+  const query = `[out:json][timeout:${OSM_QUERY_TIMEOUT_SECONDS}];
+(
+  node["amenity"~"^(restaurant|fast_food|cafe|food_court)$"](around:${boundedRadius},${lat},${lng});
+  way["amenity"~"^(restaurant|fast_food|cafe|food_court)$"](around:${boundedRadius},${lat},${lng});
+);
+out center;`;
+
   const body = new URLSearchParams({ data: query });
-  const response = await fetch(endpoint, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8',
-      'User-Agent': 'FatBuddy/1.0',
-    },
-    body,
-    signal: AbortSignal.timeout(OSM_REQUEST_TIMEOUT_MS),
-  });
 
-  if (!response.ok) throw new Error(`Overpass returned ${response.status}`);
-  const result = await response.json() as { elements?: OsmElement[] };
+  try {
+    const response = await fetch(endpoint, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8',
+        'User-Agent': 'FatBuddy/1.0',
+      },
+      body,
+      signal: AbortSignal.timeout(OSM_REQUEST_TIMEOUT_MS),
+    });
 
-  return (result.elements ?? []).flatMap((element): Restaurant[] => {
-    const tags = element.tags;
-    const placeLat = element.lat ?? element.center?.lat;
-    const placeLng = element.lon ?? element.center?.lon;
-    const name = tags?.['name:zh-Hant']
-      || tags?.['name:zh']
-      || tags?.name
-      || tags?.['name:en']
-      || tags?.brand;
-    if (!element.type || !element.id || !name || !Number.isFinite(placeLat) || !Number.isFinite(placeLng)) return [];
+    if (!response.ok) {
+      console.error(`[OSM] Overpass returned status ${response.status}`);
+      return [];
+    }
 
-    const address = tags?.['addr:full']
-      || [tags?.['addr:housenumber'], tags?.['addr:street'], tags?.['addr:city']].filter(Boolean).join(' ');
-    return [{
-      id: `osm:${element.type}:${element.id}`,
-      name,
-      lat: placeLat!,
-      lng: placeLng!,
-      rating: 0,
-      address,
-      source: 'osm',
-      type: tags?.cuisine || tags?.amenity,
-      price: tags?.price_range,
-    }];
-  });
+    const result = (await response.json()) as { elements?: OsmElement[] };
+
+    return (result.elements ?? []).flatMap((element): Restaurant[] => {
+      const tags = element.tags;
+      const placeLat = element.lat ?? element.center?.lat;
+      const placeLng = element.lon ?? element.center?.lon;
+      const name =
+        tags?.['name:zh-Hant'] ||
+        tags?.['name:zh'] ||
+        tags?.name ||
+        tags?.['name:en'] ||
+        tags?.brand;
+
+      if (!element.type || !element.id || !name || !Number.isFinite(placeLat) || !Number.isFinite(placeLng)) {
+        return [];
+      }
+
+      const address =
+        tags?.['addr:full'] ||
+        [tags?.['addr:housenumber'], tags?.['addr:street'], tags?.['addr:city']].filter(Boolean).join(' ');
+
+      const osmUniqueId = `${element.type}:${element.id}`;
+
+      return [
+        {
+          id: `osm:${osmUniqueId}`,
+          osmId: osmUniqueId, // 明確賦予 osmId
+          name,
+          lat: placeLat!,
+          lng: placeLng!,
+          rating: 0,
+          address,
+          source: 'osm',
+          sources: ['osm'],
+          type: tags?.cuisine || tags?.amenity,
+          price: tags?.price_range,
+        },
+      ];
+    });
+  } catch (err) {
+    console.error('[OSM] Fetch failed or timed out:', err);
+    return []; // 失敗時優雅降級回傳空陣列，不影響其他數據源
+  }
 }
 
 function mergePlaces(sourceGroups: Restaurant[][]): Restaurant[] {
   const merged: Restaurant[] = [];
 
   for (const sourceGroup of sourceGroups) {
-    const additions: Restaurant[] = [];
     for (const candidate of sourceGroup) {
       const candidateName = normalizePlaceText(candidate.name);
       const candidateAddress = normalizePlaceText(candidate.address);
-      const duplicate = merged.some((place) => {
-        if (distanceMeters(place.lat, place.lng, candidate.lat, candidate.lng) > 35) return false;
-        const namesMatch = normalizePlaceText(place.name) === candidateName;
-        const addressesMatch = Boolean(candidateAddress)
-          && normalizePlaceText(place.address) === candidateAddress;
-        return namesMatch || addressesMatch;
+
+      const candidateGoogleId = candidate.googlePlaceId || (candidate.source === 'google' ? candidate.id.replace('google:', '') : undefined);
+      const candidateAmapId = candidate.amapPoiId || (candidate.source === 'amap' ? candidate.id.replace('amap:', '') : undefined);
+      const candidateFehdId = candidate.fehdObjectId || (candidate.source === 'fehd' ? candidate.id.replace('fehd:', '') : undefined);
+      const candidateOsmId = candidate.osmId || (candidate.source === 'osm' ? candidate.id.replace('osm:', '') : undefined);
+
+      const existing = merged.find((place) => {
+        // A. 原始 ID 碰撞 (100% 精準)
+        if (candidateGoogleId && place.googlePlaceId === candidateGoogleId) return true;
+        if (candidateAmapId && place.amapPoiId === candidateAmapId) return true;
+        if (candidateFehdId && place.fehdObjectId === candidateFehdId) return true;
+        if (candidateOsmId && place.osmId === candidateOsmId) return true;
+
+        const dist = distanceMeters(place.lat, place.lng, candidate.lat, candidate.lng);
+        const firstName = normalizePlaceText(place.name);
+
+        // B. 規則一：名稱完全相同，放寬距離限制至 500 米（覆蓋座標偏差）
+        if (firstName && candidateName && firstName === candidateName && dist <= 500) {
+          return true;
+        }
+
+        // C. 規則二：距離 <= 150 米 + (名稱相互包含 或 地址相同)
+        if (dist <= 150) {
+          const namesMatch = firstName.includes(candidateName) || candidateName.includes(firstName);
+          const addressesMatch = Boolean(candidateAddress) && normalizePlaceText(place.address) === candidateAddress;
+          return namesMatch || addressesMatch;
+        }
+
+        return false;
       });
 
-      if (!duplicate) additions.push(candidate);
+      if (existing) {
+        // 互通有無：補充來源與缺失欄位
+        existing.sources ??= [existing.source];
+        if (!existing.sources.includes(candidate.source)) {
+          existing.sources.push(candidate.source);
+        }
+
+        if (candidateGoogleId) existing.googlePlaceId = candidateGoogleId;
+        if (candidateAmapId) existing.amapPoiId = candidateAmapId;
+        if (candidateFehdId) existing.fehdObjectId = candidateFehdId;
+        if (candidateOsmId) existing.osmId = candidateOsmId;
+
+        // 優先保留詳細地址（FEHD 的地址通常比 Google 的「香港新界荃灣」更詳細）
+        if ((!existing.address || existing.address.length < 8) && candidate.address) {
+          existing.address = candidate.address;
+        }
+
+        if (!existing.rating && candidate.rating) existing.rating = candidate.rating;
+        if (!existing.userRatingCount && candidate.userRatingCount) existing.userRatingCount = candidate.userRatingCount;
+        if (!existing.price && candidate.price) existing.price = candidate.price;
+        if (!existing.licenseType && candidate.licenseType) existing.licenseType = candidate.licenseType;
+        if (!existing.type && candidate.type) existing.type = candidate.type;
+
+      } else {
+        merged.push({
+          ...candidate,
+          googlePlaceId: candidateGoogleId,
+          amapPoiId: candidateAmapId,
+          fehdObjectId: candidateFehdId,
+          osmId: candidateOsmId,
+          sources: candidate.sources || [candidate.source],
+        });
+      }
     }
-    merged.push(...additions);
   }
 
   return merged;
@@ -478,7 +648,7 @@ export default {
 
     const geohash = ngeohash.encode(lat, lng, 6);
     const sourceSet = `${env.GOOGLE_MAPS_KEY ? 'g' : ''}${region !== 'global' && env.AMAP_KEY ? 'a' : ''}${region === 'hk' ? 'f' : ''}o`;
-    const cacheKey = `places:v7:${sourceSet}:${region}:${Math.round(radius)}:${geohash}`;
+    const cacheKey = `places:v10:${sourceSet}:${region}:${Math.round(radius)}:${geohash}`;
 
     try {
       const cached = await env.GEO_CACHE.get(cacheKey);
